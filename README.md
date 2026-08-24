@@ -110,19 +110,24 @@ Linux x86-64. Times are the best of repeated warm runs.
 
 | benchmark | Mojo / compatibility | reference | ratio | result |
 |---|---:|---:|---:|---|
-| Viterbi, 48,002 nodes / 287,976 edges | 3.745 ms (Mojo) | 259.414 ms (Python) | 69.28x | faster |
-| Batched Viterbi, 64 x 3,602 nodes | 25.214 ms (Mojo) | 2219.272 ms (Python) | 88.02x | faster |
-| UniDic lattice re-decode, 6,322 nodes | 0.373 ms (Mojo) | 39.584 ms (Python) | 106.11x | faster |
-| UTF-8 boundaries, 510,000 code points | 3.051 ms (Mojo) | 84.702 ms (Python) | 27.77x | faster |
-| `Tagger.parse` compatibility, 50,000 chars | 19.829 ms (compat) | 19.856 ms (`mecab-python3`) | 1.00x | same C++ backend |
+| Viterbi, 48,002 nodes / 287,976 edges | 3.543 ms (Mojo) | 267.985 ms (Python) | 75.63x | faster |
+| Batched Viterbi, 64 x 3,602 nodes | 17.879 ms (Mojo) | 1333.131 ms (Python) | 74.56x | faster |
+| UniDic lattice re-decode, 6,322 nodes | 0.367 ms (Mojo) | 40.635 ms (Python) | 110.81x | faster |
+| UTF-8 boundaries, 510,000 code points | 3.075 ms (Mojo) | 86.197 ms (Python) | 28.03x | faster |
+| `Tagger.parse` compatibility, 50,000 chars | 19.705 ms (compat) | 19.190 ms (`mecab-python3`) | 0.97x | same C++ backend |
 
 The Viterbi reference is the straightforward pure-Python implementation shipped
 in `reference_decode`; the UniDic row uses an actual candidate lattice and path
 costs extracted from upstream. The final row is intentionally reported even
-though both calls use the same upstream C++ implementation. Its 1.00x result
-is timing variation, not a Mojo speedup.
+though both calls use the same upstream C++ implementation. Its near-1.00x
+result is timing variation, not a Mojo speedup.
 Candidate generation is outside the Mojo-covered subset, so end-to-end
 `Tagger.parse` should be expected to perform like `mecab-python3`.
+
+No SIMD or parallel path was added: every Mojo-owned kernel is already more
+than 5x ahead of its reference, while profiling the parity row attributes all
+time directly to the shared upstream `MeCab.Tagger.parse` method. There is no
+Mojo loop on that path to optimize.
 
 No GPU path is provided. The lattice decoder performs roughly one integer add
 per edge while loading an edge cost, predecessor index, and predecessor total;
