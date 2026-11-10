@@ -8,33 +8,45 @@ comptime I64_MAX = Int64(0x7FFFFFFFFFFFFFFF)
 comptime I64_MIN = -I64_MAX - 1
 
 
-def decode_one(
+@always_inline
+def _decode_one(
     node_count: Int,
     edge_offsets: I64Ptr,
     predecessors: I64Ptr,
     edge_costs: I64Ptr,
     totals: I64Ptr,
     backpointers: I64Ptr,
-    edge_base: Int = 0,
-    node_base: Int = 0,
+    edge_base: Int,
+    node_base: Int,
 ) -> Int:
-    if node_count <= 0:
-        return 0
-    totals[node_base] = 0
-    backpointers[node_base] = -1
-    for node in range(1, node_count):
-        var best = I64_MAX
-        var best_predecessor = Int64(-1)
-        var edge = Int(edge_offsets[node])
-        var edge_end = Int(edge_offsets[node + 1])
+    var totals_base = totals + node_base
+    var backpointers_base = backpointers + node_base
+    totals_base.unsafe_store(0, 0)
+    backpointers_base.unsafe_store(0, -1)
+    var best = Int64(0)
+    var best_predecessor = Int64(-1)
+    var edge = 0
+    var edge_end = 0
+    var node = 0
+    while node + 1 < node_count:
+        best = I64_MAX
+        best_predecessor = Int64(-1)
+        edge = edge_end
+        edge_end = Int(edge_offsets.unsafe_load(node + 2))
         while edge < edge_end:
-            var predecessor = Int(predecessors[edge])
-            var previous = totals[node_base + predecessor]
-            if predecessor == 0 or backpointers[node_base + predecessor] >= 0:
-                var cost = edge_costs[edge_base + edge]
-                if (cost > 0 and previous > I64_MAX - cost) or (
-                    cost < 0 and previous < I64_MIN - cost
-                ):
+            var predecessor = Int(predecessors.unsafe_load(edge))
+            # Every node except BOS is written below with a backpointer that is
+            # -1 exactly when it is unreachable, so the bounds are implied.
+            var previous = totals_base.unsafe_load(predecessor)
+            var reachable = predecessor == 0
+            if not reachable:
+                reachable = backpointers_base.unsafe_load(predecessor) >= 0
+            if reachable:
+                var cost = edge_costs.unsafe_load(edge_base + edge)
+                var overflow = previous > I64_MAX - cost
+                if cost < 0:
+                    overflow = previous < I64_MIN - cost
+                if overflow:
                     return -1
                 var candidate = previous + cost
                 # MeCab replaces the predecessor on ties.
@@ -42,9 +54,35 @@ def decode_one(
                     best = candidate
                     best_predecessor = Int64(predecessor)
             edge += 1
-        totals[node_base + node] = best
-        backpointers[node_base + node] = best_predecessor
-    return 1 if backpointers[node_base + node_count - 1] >= 0 else 0
+        totals_base.unsafe_store(node + 1, best)
+        backpointers_base.unsafe_store(node + 1, best_predecessor)
+        node += 1
+    return 1 if backpointers_base.unsafe_load(node_count - 1) >= 0 else 0
+
+
+@always_inline
+def _validate(
+    node_count: Int,
+    edge_count: Int,
+    edge_offsets: I64Ptr,
+    predecessors: I64Ptr,
+) -> Bool:
+    if edge_offsets.unsafe_load(0) != 0 or edge_offsets.unsafe_load(
+        node_count
+    ) != Int64(edge_count):
+        return False
+    for node in range(node_count):
+        if edge_offsets.unsafe_load(node) > edge_offsets.unsafe_load(node + 1):
+            return False
+    for node in range(1, node_count):
+        var end = Int(edge_offsets.unsafe_load(node + 1))
+        var edge = Int(edge_offsets.unsafe_load(node))
+        while edge < end:
+            var predecessor = predecessors.unsafe_load(edge)
+            if predecessor < 0 or predecessor >= Int64(node):
+                return False
+            edge += 1
+    return True
 
 
 @export("mm_viterbi_decode")
@@ -72,22 +110,17 @@ def mm_viterbi_decode(
     var edge_costs = I64Ptr(unsafe_from_address=edge_costs_addr)
     var totals = I64Ptr(unsafe_from_address=totals_addr)
     var backpointers = I64Ptr(unsafe_from_address=backpointers_addr)
-    if edge_offsets[0] != 0 or edge_offsets[node_count] != Int64(edge_count):
+    if not _validate(node_count, edge_count, edge_offsets, predecessors):
         return 0
-    for node in range(node_count):
-        if edge_offsets[node] > edge_offsets[node + 1]:
-            return 0
-    for node in range(1, node_count):
-        for edge in range(Int(edge_offsets[node]), Int(edge_offsets[node + 1])):
-            if predecessors[edge] < 0 or predecessors[edge] >= Int64(node):
-                return 0
-    return decode_one(
+    return _decode_one(
         node_count,
         edge_offsets,
         predecessors,
         edge_costs,
         totals,
         backpointers,
+        0,
+        0,
     )
 
 
@@ -117,17 +150,10 @@ def mm_viterbi_decode_batch(
     var edge_costs = I64Ptr(unsafe_from_address=edge_costs_addr)
     var totals = I64Ptr(unsafe_from_address=totals_addr)
     var backpointers = I64Ptr(unsafe_from_address=backpointers_addr)
-    if edge_offsets[0] != 0 or edge_offsets[node_count] != Int64(edge_count):
+    if not _validate(node_count, edge_count, edge_offsets, predecessors):
         return 0
-    for node in range(node_count):
-        if edge_offsets[node] > edge_offsets[node + 1]:
-            return 0
-    for node in range(1, node_count):
-        for edge in range(Int(edge_offsets[node]), Int(edge_offsets[node + 1])):
-            if predecessors[edge] < 0 or predecessors[edge] >= Int64(node):
-                return 0
     for batch in range(batch_size):
-        var status = decode_one(
+        var status = _decode_one(
             node_count,
             edge_offsets,
             predecessors,
