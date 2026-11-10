@@ -300,12 +300,43 @@ forward pass over one row cannot be split further: node `n` reads totals written
 for earlier nodes, so within a row the order is fixed. Parallelism is only
 across rows in `decode_batch`, and only above the threshold above.
 
-No GPU path is provided. The lattice decoder performs roughly one integer add
-per edge while loading an edge cost, predecessor index, and predecessor total;
-UTF-8 indexing similarly does little arithmetic per byte read and offset
-written. The only benchmark at parity with upstream is `Tagger.parse`, which is
-the exact same
-`mecab-python3` class and native C++ backend rather than a Mojo kernel.
+### GPU: CPU only: memory-bound
+
+No GPU path is provided, and none is worth providing: every kernel in this port
+is memory-bound. The figure below is derived from the shipped source in
+`src/kernels.mojo` rather than from a microbenchmark; the GPU phase's gate
+(`bench/analysis.md`, ~2 flops per byte) has no such file in this checkout and
+none in the repository history, so the arithmetic intensity was counted by hand
+from the code paths that exist.
+
+| kernel | work per unit | bytes moved per unit | flops per byte |
+|---|---|---:|---:|
+| `_decode_one` (Viterbi forward pass) | ~3 integer add/sub/cmps per edge | 32 read (predecessor, cost, predecessor total, predecessor backpointer) + 16 written per node | ~0.08 |
+| `_validate` (CSR/topology check) | 1 compare per offset or predecessor word | 8 | 0.125 |
+| `mm_utf8_boundaries` | 1-3 compares per byte, 1 add per code point | 1 read per byte + 8 written per code point | < 0.3 |
+
+All three are an order of magnitude below the 2 flops/byte gate. The decoder's
+per-edge traffic is dominated by two indirect loads (the predecessor's total and
+backpointer) whose addresses depend on the edge, which is exactly the pattern a
+GPU handles worst: no coalescing, and a dependent load in the loop. The forward
+pass is also sequential within a row, as described above, so a row cannot be
+spread over blocks at all. The only parallel axis is across batch rows, which
+the CPU path already uses above its threshold.
+
+The device itself was not the blocker. On this host
+`nvidia-smi --query-gpu=memory.free` reported 4557 MiB free (gate: at least
+4000 MiB), and the documented `max.gpu` host surface compiles and runs on the
+pinned toolchain: a probe building and running `DeviceContext` with
+`enqueue_create_buffer[DType.float64]` and `synchronize()` succeeded on an
+RTX 5090. There is no GPU code in the port, therefore no GPU tests: nothing is
+skipped, because nothing GPU-only was added. The full test suite runs on a
+CPU-only host unchanged (`93 passed, 8 skipped`; all 8 skips are pre-existing
+lattice-shape guards in `tests/test_simd_paths.py` for unreachable EOS, not
+device detection).
+
+The only benchmark at parity with upstream is `Tagger.parse`, which is the
+exact same `mecab-python3` class and native C++ backend rather than a Mojo
+kernel.
 
 ## How it works
 
