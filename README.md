@@ -109,7 +109,9 @@ Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
 Linux x86-64. Times are the best of repeated warm runs.
 
 The table below is the current build. The rows that moved since the previous
-commit, and the sizes of the moves, are in the next section.
+commit, and the sizes of the moves, are in the next section. The batched row is
+the serial tier: at 3,602 nodes per row it is below the measured parallel
+crossover, so this phase does not change it; see "Parallel batch decoding".
 
 | benchmark | Mojo / compatibility | reference | ratio | result |
 |---|---:|---:|---:|---|
@@ -153,6 +155,100 @@ around a kernel that costs about 0.06 ms on a 6,322-node lattice; the rest is
 `str.encode` and array copies. The one real movement is the UniDic single
 decode, whose kernel got about 13% faster when measured in isolation. The UTF-8
 row is flat, as expected, since no UTF-8 code changed.
+
+### Parallel batch decoding
+
+Batched decoding (``decode_batch``) runs its rows in parallel once a row is
+large enough, using `parallelize` from `max.algorithm`. Rows are independent, so
+each worker decodes a contiguous run of rows and returns status through its own
+slot; the result is bit-identical to the serial loop
+(`tests/test_parallel_paths.py` compares every row, including the last, against
+the serial reference at and around both thresholds).
+
+This needed a toolchain change: `parallelize` lives in the `max` package on this
+toolchain, and the previous pin (mojo 1.2.0) had no `max` beside it, so the
+import could not resolve. `pixi.toml` now pins `mojo ==1.3.0.dev2026111005`
+with the matching `max ==26.8.0.dev2026111005`, and the kernel uses `Pointer`
+in place of the removed `UnsafePointer`. The tests pass unchanged otherwise.
+
+**Threshold.** The gate is per row, in kernel terms: `nodes >= 4096` or
+`edges >= 128`, and at least 2 rows. The second clause is measured, not
+decorative: the unzipped wall clock of a row is what decides, and the edge form
+keeps a few-node, very wide lattice from being gated on its node count alone.
+The worker count is `min(rows, 4)`.
+
+Isolated kernel time (ctypes call only, median ms, `taskset -c 0,2,4,6`) from
+`bench/parallel_crossover.py`, on the shared Xeon host:
+
+| nodes | edges | rows | 1 worker (serial) | 2 workers | 4 workers | shipped |
+|---:|---:|---:|---:|---:|---:|---:|
+| 194 | 1,128 | 64 | 0.21 | 0.51 | 0.57 | 0.57 |
+| 3,602 | 21,576 | 4 | 0.28 | 0.54 | 0.61 | 0.62 |
+| 3,602 | 21,576 | 16 | 1.03 | 1.25 | 0.83 | 0.86 |
+| 3,602 | 21,576 | 64 | 4.02 | 2.42 | 1.56 | 1.56 |
+| 12,002 | 71,976 | 64 | 14.21 | 9.19 | 7.49 | 6.85 |
+| 36,002 | 215,976 | 64 | 44.77 | 24.09 | 20.19 | 21.48 |
+| 72,002 | 431,976 | 12 | 16.19 | 10.26 | 8.88 | 9.12 |
+| 72,002 | 431,976 | 64 | 98.36 | 44.16 | 39.55 | 41.24 |
+| 144,002 | 863,976 | 4 | 12.67 | 8.51 | 5.82 | 5.20 |
+| 144,002 | 863,976 | 64 | 165.96 | 87.59 | 51.40 | 51.27 |
+
+"shipped" is the build in this checkout, with its own threshold; the other
+columns are the same source with the parallel path forced on, so the 1-worker
+column is the serial baseline through the identical loop.
+
+**Crossover and margin.** The ramp, serial vs 4 workers, 64 rows:
+
+| row | serial | 4 workers | speedup |
+|---|---:|---:|---:|
+| 194 x 1,128 | 0.217 ms | 0.570 ms | 0.38x |
+| 602 x 3,576 | 0.667 ms | 0.689 ms | 0.97x |
+| 902 x 5,376 | 1.006 ms | 0.786 ms | 1.28x |
+| 1,202 x 7,176 | 1.351 ms | 0.944 ms | 1.43x |
+| 1,802 x 10,776 | 2.021 ms | 1.043 ms | 1.94x |
+| 2,402 x 14,376 | 2.703 ms | 1.939 ms | 1.39x |
+| 3,602 x 21,576 | 4.000 ms | 1.601 ms | 2.50x |
+| 6,002 x 35,976 | 6.709 ms | 2.367 ms | 2.83x |
+| 12,002 x 71,976 | 13.971 ms | 6.451 ms | 2.17x |
+
+A win is first visible around 900 nodes per row (~1 ms of row work) at roughly
+1.3x, and is unambiguous from ~3,600 nodes (the `pixi run bench` batch shape)
+at 2.4-2.8x. 4,096 is that crossover with margin: the worker hand-off plus
+memory wake-up on this host costs about 14 us per worker slot, and the
+1,802-node row / 1.94x and 2,402-node row / 1.39x points show it is nowhere
+near a cliff. Below 4,096 nodes per row, callers stay serial and are measured
+at 0.38-0.97x against the forced-parallel form, so the gate matters.
+
+**Worker count: 1, 2, 4 and the cap.** The chip is a 2-socket 72-thread Xeon
+with a shared host load around 25-40. Measured on the build that splits rows
+across workers, median ms:
+
+| row | rows | 1 worker | 2 workers | 4 workers |
+|---|---:|---:|---:|---:|
+| 1,202 | 64 | 1.37 | 1.06 | 1.23 |
+| 1,802 | 64 | 2.02 | 1.60 | 2.25 |
+| 2,402 | 64 | 2.69 | 1.83 | 1.96 |
+| 3,602 | 64 | 4.01 | 2.69 | 3.79 |
+| 7,802 | 64 | 8.81 | 5.38 | 4.96 |
+| 12,002 | 64 | 13.50 | 7.73 | 7.05 |
+| 12,002 | 16 | 3.45 | 3.74 | 2.11 |
+
+The gain does not flatten and reverse above the threshold: 4 workers is the
+fastest or within noise of it from 3,602 nodes up, and 2 workers is usually the
+right count just above the gate, where worker start-up is a larger share. The
+cap of 4 is kept: no configuration measured faster, and on the shapes where
+4 pinned CPUs are available the 1-work-item-per-worker split already uses all
+four. On the 16-row, 72,002-node and 144,002-node shapes the gain is 2.6x and
+2.5x, still short of 4x because the rows themselves are unequal.
+
+**What this did not fix.** The `pixi run bench` harness only measures the
+3,602-node batch, which stays on the serial tier by design, and on this shared
+host that row is noisy: 28.310 ms normally, 19.7-20.4 ms with nothing else
+running, and 17.2-23.6 ms two runs in a row. The isolated kernel call for the
+same shape is about 4.0 ms, so the rest is the harness and host load, not
+parallelism. The batch row in this build is therefore not comparable to the
+15.8-16.8 ms recorded in the earlier commits; that is a measurement-environment
+difference, and it is recorded here rather than presented as a win or a loss.
 
 ### What was measured and reverted
 
@@ -199,7 +295,10 @@ predecessor total written earlier in the same pass, and the tie rule keeps the
 last equal candidate, so the running order is part of the result and the loop is
 not vectorisable. Profiling the lattice rows attributes most of their wall time
 to the `ctypes` call and the Numpy buffers around the kernel, which is why a
-kernel-level gain shows up as a fraction of that in `pixi run bench`.
+kernel-level gain shows up as a fraction of that in `pixi run bench`. The
+forward pass over one row cannot be split further: node `n` reads totals written
+for earlier nodes, so within a row the order is fixed. Parallelism is only
+across rows in `decode_batch`, and only above the threshold above.
 
 No GPU path is provided. The lattice decoder performs roughly one integer add
 per edge while loading an edge cost, predecessor index, and predecessor total;

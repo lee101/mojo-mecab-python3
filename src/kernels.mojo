@@ -1,15 +1,39 @@
 """MeCab-style lattice dynamic programming and UTF-8 indexing kernels."""
 
 from std.sys import simd_width_of
+from max.algorithm import parallelize
 
-comptime I64Ptr = UnsafePointer[Int64, AnyOrigin[mut=True]]
-comptime I32Ptr = UnsafePointer[Int32, AnyOrigin[mut=True]]
-comptime U8Ptr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
+comptime I64Ptr = Pointer[Int64, AnyOrigin[mut=True]]
+comptime I32Ptr = Pointer[Int32, AnyOrigin[mut=True]]
+comptime U8Ptr = Pointer[UInt8, AnyOrigin[mut=True]]
 
 comptime I64_MAX = Int64(0x7FFFFFFFFFFFFFFF)
 comptime I64_MIN = -I64_MAX - 1
 
 comptime W64 = simd_width_of[DType.int64]()
+
+# A batch row is decoded in parallel only when its measured cost is at least
+# this many nodes, or this many edges. Both are crossover estimates with margin,
+# taken from "Parallel batch decoding" in README.md: below either, the whole
+# batch is shorter than the worker hand-off, so the caller stays serial.
+#
+# 2,402 nodes x 64 rows is 2.69 ms serial and 1.83 ms on two workers (1.47x);
+# below that, measured gains are inside run-to-run spread on this host.
+comptime PARALLEL_NODE_THRESHOLD = 4096
+# The sweep's widest measured row is 127 edges per node; 128 leaves the same
+# margin above it.
+comptime PARALLEL_EDGE_THRESHOLD = 128
+
+# The host is shared, so workers are capped at 4. The measured sweep never beat
+# this on the threshold sizes; see the README.
+comptime MAX_WORKERS = 4
+
+
+@always_inline
+def _batch_should_parallelize(node_count: Int, edge_count: Int, batch_size: Int) -> Bool:
+    if batch_size < 2:
+        return False
+    return node_count >= PARALLEL_NODE_THRESHOLD or edge_count >= PARALLEL_EDGE_THRESHOLD
 
 
 @always_inline
@@ -208,6 +232,53 @@ def mm_viterbi_decode_batch(
     var backpointers = I64Ptr(unsafe_from_address=backpointers_addr)
     if not _validate(node_count, edge_count, edge_offsets, predecessors):
         return 0
+    if _batch_should_parallelize(node_count, edge_count, batch_size):
+        # Rows are independent: row `batch` reads its own cost slice and writes
+        # its own totals/backpointer slice, so the store-only `{imm}` capture
+        # below is safe. Rows are split into contiguous chunks, one per worker,
+        # rather than one work item per row: a work item here is a whole forward
+        # pass (hundreds of microseconds), so the split costs nothing, and short
+        # batches no longer force a worker to start for a single row.
+        var offsets_ptr = edge_offsets
+        var predecessors_ptr = predecessors
+        var costs_ptr = edge_costs
+        var totals_ptr = totals
+        var backpointers_ptr = backpointers
+        var nodes = node_count
+        var edges = edge_count
+        var workers = min(batch_size, MAX_WORKERS)
+        var rows = batch_size
+        var base_rows = rows // workers
+        var rest = rows % workers
+        var failed_flags = List[Int](length=workers, fill=1)
+        var failed_ptr = failed_flags.unsafe_ptr()
+        def chunk_work(worker: Int) {imm}:
+            var start = worker * base_rows + min(worker, rest)
+            var stop = start + base_rows + (1 if worker < rest else 0)
+            var failed = 1
+            var batch = start
+            while batch < stop:
+                var status = _decode_one(
+                    nodes,
+                    offsets_ptr,
+                    predecessors_ptr,
+                    costs_ptr,
+                    totals_ptr,
+                    backpointers_ptr,
+                    batch * edges,
+                    batch * nodes,
+                )
+                if status != 1:
+                    failed = status
+                batch += 1
+            if failed != 1:
+                failed_ptr.unsafe_store(worker, failed)
+        parallelize(chunk_work, workers, workers)
+        for worker in range(workers):
+            var status = failed_ptr.unsafe_load(worker)
+            if status != 1:
+                return status
+        return 1
     for batch in range(batch_size):
         var status = _decode_one(
             node_count,
