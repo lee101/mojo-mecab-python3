@@ -175,6 +175,9 @@ def reference_decode(
 def from_mecab_lattice(lattice) -> PackedLattice:
     """Copy a populated ``MeCab.Lattice`` into the compact Mojo layout."""
 
+    import os
+    if os.environ.get("MM_DEBUG_SIZE"):
+        print("DEBUG size", lattice.size())
     nodes = {lattice.bos_node().id: lattice.bos_node()}
     for position in range(lattice.size() + 1):
         node = lattice.begin_nodes(position)
@@ -184,6 +187,10 @@ def from_mecab_lattice(lattice) -> PackedLattice:
     eos = lattice.eos_node()
     nodes[eos.id] = eos
     ordered_ids = sorted(nodes)
+    import os as _os
+    if _os.environ.get("MM_DEBUG_IDS"):
+        print("DEBUG first-pass ids", ordered_ids)
+        print("DEBUG begin(size) id", None if lattice.begin_nodes(lattice.size()) is None else lattice.begin_nodes(lattice.size()).id, "eos", lattice.eos_node().id)
     if ordered_ids != list(range(len(ordered_ids))):
         raise ValueError("MeCab returned non-contiguous node IDs")
 
