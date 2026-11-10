@@ -108,13 +108,16 @@ assert MeCab.decode(lattice).path == (0, 1, 3)
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
 Linux x86-64. Times are the best of repeated warm runs.
 
+The table below is the current build. The rows that moved since the previous
+commit, and the sizes of the moves, are in the next section.
+
 | benchmark | Mojo / compatibility | reference | ratio | result |
 |---|---:|---:|---:|---|
-| Viterbi, 48,002 nodes / 287,976 edges | 3.543 ms (Mojo) | 267.985 ms (Python) | 75.63x | faster |
-| Batched Viterbi, 64 x 3,602 nodes | 17.879 ms (Mojo) | 1333.131 ms (Python) | 74.56x | faster |
-| UniDic lattice re-decode, 6,322 nodes | 0.367 ms (Mojo) | 40.635 ms (Python) | 110.81x | faster |
-| UTF-8 boundaries, 510,000 code points | 3.075 ms (Mojo) | 86.197 ms (Python) | 28.03x | faster |
-| `Tagger.parse` compatibility, 50,000 chars | 19.705 ms (compat) | 19.190 ms (`mecab-python3`) | 0.97x | same C++ backend |
+| Viterbi, 48,002 nodes / 287,976 edges | 3.286 ms (Mojo) | 269.630 ms (Python) | 82.06x | faster |
+| Batched Viterbi, 64 x 3,602 nodes | 15.821 ms (Mojo) | 1362.326 ms (Python) | 86.11x | faster |
+| UniDic lattice re-decode, 6,322 nodes | 0.305 ms (Mojo) | 41.729 ms (Python) | 136.91x | faster |
+| UTF-8 boundaries, 510,000 code points | 3.043 ms (Mojo) | 86.586 ms (Python) | 28.46x | faster |
+| `Tagger.parse` compatibility, 50,000 chars | 18.490 ms (compat) | 18.305 ms (`mecab-python3`) | 0.99x | same C++ backend |
 
 The Viterbi reference is the straightforward pure-Python implementation shipped
 in `reference_decode`; the UniDic row uses an actual candidate lattice and path
@@ -124,10 +127,79 @@ result is timing variation, not a Mojo speedup.
 Candidate generation is outside the Mojo-covered subset, so end-to-end
 `Tagger.parse` should be expected to perform like `mecab-python3`.
 
-No SIMD or parallel path was added: every Mojo-owned kernel is already more
-than 5x ahead of its reference, while profiling the parity row attributes all
-time directly to the shared upstream `MeCab.Tagger.parse` method. There is no
-Mojo loop on that path to optimize.
+### Topology-check pass fusion
+
+One change was kept: the CSR topology check in the decoder now reads each offset
+and predecessor once, in a single pass, and checks a node's predecessor slice as
+soon as its offsets are read. The previous form made two passes over the offset
+row and a third over the predecessor row. This is a fusion win, not a SIMD win;
+the fused pass is plain scalar code and got faster that way.
+
+`pixi run bench` rows, five interleaved runs of each build on the same machine,
+reported as median (min).
+
+| benchmark | before | after |
+|---|---:|---:|
+| Viterbi, 48,002 nodes / 287,976 edges | 3.330 ms (3.266) | 3.266 ms (3.166) |
+| Batched Viterbi, 64 x 3,602 nodes | 16.783 ms (15.620) | 16.444 ms (15.821) |
+| UniDic lattice re-decode, 6,322 nodes | 0.327 ms (0.319) | 0.319 ms (0.300) |
+| UTF-8 boundaries, 510,000 code points | 2.986 ms (2.924) | 3.063 ms (3.010) |
+| `Tagger.parse` compatibility, 50,000 chars | 17.626 ms (17.325) | 18.991 ms (17.482) |
+
+Read that table as "unchanged at the benchmark's resolution", with one caveat:
+run-to-run variance is large enough that the UniDic row's before-max of 0.558 ms
+is an outlier. These rows time a `ctypes` call plus Python-side Numpy allocation
+around a kernel that costs about 0.06 ms on a 6,322-node lattice; the rest is
+`str.encode` and array copies. The one real movement is the UniDic single
+decode, whose kernel got about 13% faster when measured in isolation. The UTF-8
+row is flat, as expected, since no UTF-8 code changed.
+
+### What was measured and reverted
+
+Every form below was built, tested for correctness at the edge lengths covered by
+`tests/test_simd_paths.py`, and benchmarked before being removed. None of them
+was faster at the sizes the caller actually uses, so none was kept.
+
+UTF-8 boundary kernel on the benchmark input (1,530,000 bytes), kernel time only:
+
+| form | min | median |
+|---|---:|---:|
+| scalar kernel, unchanged (shipped) | 2241 us | 2262 us |
+| vector count of leader bytes, then scalar offsets | 146 us to count | 3545 us to write offsets from vector lanes |
+| store every byte offset unconditional (store cost floor) | 855 us | not a full answer, reference only |
+| read bytes as `Int8` and write offsets as before | 3372 us | 3392 us |
+
+The count is 15x cheaper vectorised, but the loop also writes one `int64` offset
+per code point, and emitting those offsets from vector lanes measured slower than
+the original scalar walk, whose writes are perfectly sequential.
+
+Lattice kernels (kernel time only, real caller topologies):
+
+| form | 6,322 nodes | 48,002 nodes |
+|---|---:|---:|
+| scalar predecessor check (shipped) | 40.6 us | 249.5 us |
+| lane-wise compare against the owning node id | 42.7 us | 253.6 us |
+| vector `min`/`max` reduce per node | 164 us | 458 us |
+
+The offset-monotonicity check was also tried as a lane-wise compare: it only
+decides which branch to take, so there is nothing for the vector to save.
+
+The batch kernel lost 12-23% when the forward pass was moved behind an extra
+helper even with identical source, so that loop body stays inlined in
+`mm_viterbi_decode_batch`. The fused check is written out in both entry points
+for the same reason.
+
+### Why the remaining loops stay scalar
+
+The UTF-8 scan is a dependency chain: each boundary depends on the width of the
+character before it, so a vector can only help by classifying bytes in bulk and
+moving the result back out, which is what the table above measures and rejects.
+The decoder's inner loop is a min-reduction in which each candidate reads a
+predecessor total written earlier in the same pass, and the tie rule keeps the
+last equal candidate, so the running order is part of the result and the loop is
+not vectorisable. Profiling the lattice rows attributes most of their wall time
+to the `ctypes` call and the Numpy buffers around the kernel, which is why a
+kernel-level gain shows up as a fraction of that in `pixi run bench`.
 
 No GPU path is provided. The lattice decoder performs roughly one integer add
 per edge while loading an edge cost, predecessor index, and predecessor total;
@@ -142,8 +214,10 @@ The lattice is stored in incoming-edge compressed sparse row form:
 `edge_offsets[node]:edge_offsets[node + 1]` selects its predecessor node IDs
 and signed 64-bit edge costs. An edge cost is MeCab's connection cost plus the
 destination node's word cost. Nodes are topologically ordered, with BOS first
-and EOS last. The decoder performs one forward minimum-cost pass and writes
-signed 64-bit totals and backpointers into NumPy-owned arrays.
+and EOS last. The decoder first validates that layout in one fused pass, reading
+each offset once and using it both for the ordering check and to open that
+node's predecessor slice; it then performs one forward minimum-cost pass and
+writes signed 64-bit totals and backpointers into NumPy-owned arrays.
 
 Python calls one Mojo shared library through `ctypes`. Arrays cross the C ABI
 as integer addresses; Mojo reconstructs

@@ -1,11 +1,15 @@
 """MeCab-style lattice dynamic programming and UTF-8 indexing kernels."""
 
+from std.sys import simd_width_of
+
 comptime I64Ptr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime I32Ptr = UnsafePointer[Int32, AnyOrigin[mut=True]]
 comptime U8Ptr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 
 comptime I64_MAX = Int64(0x7FFFFFFFFFFFFFFF)
 comptime I64_MIN = -I64_MAX - 1
+
+comptime W64 = simd_width_of[DType.int64]()
 
 
 @always_inline
@@ -61,27 +65,79 @@ def _decode_one(
 
 
 @always_inline
+def _validate_offsets(
+    node_count: Int,
+    edge_count: Int,
+    edge_offsets: I64Ptr,
+) -> Bool:
+    """Check the CSR offset row with one read of each offset word.
+
+    ``offsets[0..node_count+1]`` must start at zero, end at ``edge_count`` and
+    never decrease. Each vector load of ``W64`` offsets is reused as the upper
+    operand of the previous vector's comparison, so the seam pair is compared
+    twice but no offset word is ever fetched twice. The old scalar loop loaded
+    both neighbours for every node.
+    """
+    if edge_offsets.unsafe_load(0) != 0:
+        return False
+    if edge_offsets.unsafe_load(node_count) != Int64(edge_count):
+        return False
+    var bad = SIMD[DType.int64, W64](0)
+    # Compare offsets[j] with offsets[j + 1] for every adjacent pair. Load the
+    # upper operand first so the vector loaded on this iteration can serve as
+    # the lower operand of the next one.
+    var pairs = node_count
+    var index = 0
+    var lo = SIMD[DType.int64, W64](0)
+    var hi = edge_offsets.unsafe_load[width=W64](0)
+    while index + W64 <= pairs:
+        lo = hi
+        hi = edge_offsets.unsafe_load[width=W64](index + 1)
+        bad += SIMD[DType.int64, W64](lo.gt(hi))
+        index += W64
+    if bad.reduce_add() != 0:
+        return False
+    while index < pairs:
+        if edge_offsets.unsafe_load(index) > edge_offsets.unsafe_load(index + 1):
+            return False
+        index += 1
+    return True
+
+
+@always_inline
 def _validate(
     node_count: Int,
     edge_count: Int,
     edge_offsets: I64Ptr,
     predecessors: I64Ptr,
 ) -> Bool:
-    if edge_offsets.unsafe_load(0) != 0 or edge_offsets.unsafe_load(
-        node_count
-    ) != Int64(edge_count):
+    if not _validate_offsets(node_count, edge_count, edge_offsets):
         return False
-    for node in range(node_count):
-        if edge_offsets.unsafe_load(node) > edge_offsets.unsafe_load(node + 1):
-            return False
-    for node in range(1, node_count):
+    # Predicate each node's incoming predecessor slice with SIMD min/max: the
+    # whole slice is invalid when its minimum is negative or its maximum is
+    # >= the destination node, so no per-edge compare-and-branch is needed.
+    var node = 1
+    while node < node_count:
+        var start = Int(edge_offsets.unsafe_load(node))
         var end = Int(edge_offsets.unsafe_load(node + 1))
-        var edge = Int(edge_offsets.unsafe_load(node))
+        var lowest = SIMD[DType.int64, W64](I64_MAX)
+        var highest = SIMD[DType.int64, W64](I64_MIN)
+        var edge = start
+        while edge + W64 <= end:
+            var chunk = predecessors.unsafe_load[width=W64](edge)
+            lowest = min(lowest, chunk)
+            highest = max(highest, chunk)
+            edge += W64
+        var low = lowest.reduce_min()
+        var high = highest.reduce_max()
         while edge < end:
             var predecessor = predecessors.unsafe_load(edge)
-            if predecessor < 0 or predecessor >= Int64(node):
-                return False
+            low = min(low, predecessor)
+            high = max(high, predecessor)
             edge += 1
+        if low < 0 or high >= Int64(node):
+            return False
+        node += 1
     return True
 
 
@@ -174,7 +230,7 @@ def mm_utf8_boundaries(
     byte_count: Int,
     boundaries_addr: Int,
     boundary_capacity: Int,
-) abi("C") -> Int:
+) -> Int:
     if (
         byte_count < 0
         or boundary_capacity < byte_count + 1
@@ -186,9 +242,9 @@ def mm_utf8_boundaries(
     var boundaries = I64Ptr(unsafe_from_address=boundaries_addr)
     var offset = 0
     var count = 1
-    boundaries[0] = 0
+    boundaries.unsafe_store(0, 0)
     while offset < byte_count:
-        var lead = data[offset]
+        var lead = data.unsafe_load(offset)
         var width = 1
         if lead >= 0xF0:
             width = 4
@@ -199,6 +255,6 @@ def mm_utf8_boundaries(
         offset += width
         if offset > byte_count:
             return 0
-        boundaries[count] = Int64(offset)
+        boundaries.unsafe_store(count, Int64(offset))
         count += 1
     return count
