@@ -108,24 +108,32 @@ assert MeCab.decode(lattice).path == (0, 1, 3)
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
 Linux x86-64. Times are the best of repeated warm runs.
 
-The table below is the current build. The rows that moved since the previous
-commit, and the sizes of the moves, are in the next section. The batched row is
-the serial tier: at 3,602 nodes per row it is below the measured parallel
-crossover, so this phase does not change it; see "Parallel batch decoding".
+The table below was re-measured for the VERIFY pass. It is one complete
+`pixi run bench` run on a shared 72-thread Xeon E5-2697 v4 whose load average
+was 92 during measurement; `bench/verify.md` records the repeat runs behind each
+row and which ones were corrected. The batched row is the serial tier: at 3,602
+nodes per row it is below the measured parallel crossover, so the parallel work
+does not change it; see "Parallel batch decoding". Earlier revisions quoted
+15.8-16.4 ms for that row, which was not reproduced on this host, and 86.11x;
+the measured values replace them.
 
 | benchmark | Mojo / compatibility | reference | ratio | result |
 |---|---:|---:|---:|---|
-| Viterbi, 48,002 nodes / 287,976 edges | 3.286 ms (Mojo) | 269.630 ms (Python) | 82.06x | faster |
-| Batched Viterbi, 64 x 3,602 nodes | 15.821 ms (Mojo) | 1362.326 ms (Python) | 86.11x | faster |
-| UniDic lattice re-decode, 6,322 nodes | 0.305 ms (Mojo) | 41.729 ms (Python) | 136.91x | faster |
-| UTF-8 boundaries, 510,000 code points | 3.043 ms (Mojo) | 86.586 ms (Python) | 28.46x | faster |
-| `Tagger.parse` compatibility, 50,000 chars | 18.490 ms (compat) | 18.305 ms (`mecab-python3`) | 0.99x | same C++ backend |
+| Viterbi, 48,002 nodes / 287,976 edges | 3.338 ms (Mojo) | 254.147 ms (Python) | 76.13x | faster |
+| Batched Viterbi, 64 x 3,602 nodes | 19.803 ms (Mojo) | 1383.864 ms (Python) | 69.88x | faster |
+| UniDic lattice re-decode, 6,322 nodes | 0.351 ms (Mojo) | 40.813 ms (Python) | 116.40x | faster |
+| UTF-8 boundaries, 510,000 code points | 2.968 ms (Mojo) | 84.585 ms (Python) | 28.50x | faster |
+| `Tagger.parse` compatibility, 50,000 chars | 19.023 ms (compat) | 19.484 ms (`mecab-python3`) | 1.02x | same C++ backend |
+
+`bench/verify.md` records the per-row repeat runs, the two figures that were
+corrected, and the parts of this section that were not re-measured.
 
 The Viterbi reference is the straightforward pure-Python implementation shipped
 in `reference_decode`; the UniDic row uses an actual candidate lattice and path
 costs extracted from upstream. The final row is intentionally reported even
 though both calls use the same upstream C++ implementation. Its near-1.00x
-result is timing variation, not a Mojo speedup.
+result is timing variation, not a Mojo speedup: across four repeat measurements
+it landed at 0.96x to 1.02x.
 Candidate generation is outside the Mojo-covered subset, so end-to-end
 `Tagger.parse` should be expected to perform like `mecab-python3`.
 
@@ -156,6 +164,15 @@ around a kernel that costs about 0.06 ms on a 6,322-node lattice; the rest is
 decode, whose kernel got about 13% faster when measured in isolation. The UTF-8
 row is flat, as expected, since no UTF-8 code changed.
 
+The before/after columns above were not re-measured in the VERIFY pass, because
+"before" needs a build that no longer exists in the tree, so they are kept as
+the phase's record and not as evidence of a speedup. What the VERIFY pass did
+measure on the shipped build puts the decoder within reach of the "after"
+column (Viterbi 3.338 ms and UniDic 0.351 ms in one `pixi run bench` run), while
+the batched and `Tagger.parse` rows landed at 19.803 ms and 19.023 ms on a host
+with load average 92, which is not a contradiction at this noise level but is
+not a reproduction of the "after" figures either. See `bench/verify.md`.
+
 ### Parallel batch decoding
 
 Batched decoding (``decode_batch``) runs its rows in parallel once a row is
@@ -178,7 +195,12 @@ keeps a few-node, very wide lattice from being gated on its node count alone.
 The worker count is `min(rows, 4)`.
 
 Isolated kernel time (ctypes call only, median ms, `taskset -c 0,2,4,6`) from
-`bench/parallel_crossover.py`, on the shared Xeon host:
+`bench/parallel_crossover.py`, on the shared Xeon host. This is the phase's
+original sweep and was not reproduced number-for-number in the VERIFY pass; the
+two sweeps run there moved absolute times by up to 5-15% in both directions, the
+64-row 3,602-node shape no longer showed a parallel win, and the parallel-wins-
+on-large-rows conclusion plus the crossover shape did hold. See
+`bench/verify.md` and "Crossover" below:
 
 | nodes | edges | rows | 1 worker (serial) | 2 workers | 4 workers | shipped |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -197,7 +219,14 @@ Isolated kernel time (ctypes call only, median ms, `taskset -c 0,2,4,6`) from
 columns are the same source with the parallel path forced on, so the 1-worker
 column is the serial baseline through the identical loop.
 
-**Crossover and margin.** The ramp, serial vs 4 workers, 64 rows:
+**Crossover and margin.** The ramp, serial vs 4 workers, 64 rows. The table
+below is the phase's original ramp. The VERIFY pass re-ran the same ramp with
+the same script (median of 31 calls per cell) and recorded it in
+`bench/verify.md`; the direction reproduced (serial beats parallel below ~900
+nodes per row, parallel wins from ~900 up), but individual cells moved a lot on
+the loaded host, and the VERIFY ramp measured 0.71x at the 614-node row, which
+is a loss; so the 602-node row's 0.97x tie does not reproduce, and that row sits
+inside this host's noise rather than on the crossover.
 
 | row | serial | 4 workers | speedup |
 |---|---:|---:|---:|
@@ -250,11 +279,22 @@ parallelism. The batch row in this build is therefore not comparable to the
 15.8-16.8 ms recorded in the earlier commits; that is a measurement-environment
 difference, and it is recorded here rather than presented as a win or a loss.
 
+The VERIFY pass confirmed the diagnosis rather than the numbers. Across five
+complete `pixi run bench` runs the batch row measured 19.652-25.601 ms, and the
+host's load average was 92 at the time. The same shape timed through the
+identical `decode_batch` call ranges 19.7-44.1 ms from run to run, most of it
+`_trace` plus the NumPy allocations around the kernel. The isolated kernel call
+for this shape is 3.18-10.15 ms depending on host load, which matches the 4.0 ms
+above at the low end and is the parallel decision's input, not the harness's.
+
 ### What was measured and reverted
 
 Every form below was built, tested for correctness at the edge lengths covered by
 `tests/test_simd_paths.py`, and benchmarked before being removed. None of them
-was faster at the sizes the caller actually uses, so none was kept.
+was faster at the sizes the caller actually uses, so none was kept. These are
+the phase's measurements of code that is no longer in the tree, so the VERIFY
+pass could not rerun them; only the shipped rows are reachable from this
+checkout, and they are not re-measured here either.
 
 UTF-8 boundary kernel on the benchmark input (1,530,000 bytes), kernel time only:
 
@@ -304,10 +344,13 @@ across rows in `decode_batch`, and only above the threshold above.
 
 No GPU path is provided, and none is worth providing: every kernel in this port
 is memory-bound. The figure below is derived from the shipped source in
-`src/kernels.mojo` rather than from a microbenchmark; the GPU phase's gate
-(`bench/analysis.md`, ~2 flops per byte) has no such file in this checkout and
-none in the repository history, so the arithmetic intensity was counted by hand
-from the code paths that exist.
+`src/kernels.mojo` rather than from a microbenchmark; the GPU phase's gate is a
+~2 flops per byte threshold whose file, `bench/analysis.md`, does not exist in
+this checkout or anywhere in the repository history, so the arithmetic intensity
+was counted by hand from the code paths that exist. The counts themselves were
+not re-derived in the VERIFY pass; what it did check is that no GPU code and no
+GPU-gated tests are present, and that `bench/analysis.md` has never been
+committed.
 
 | kernel | work per unit | bytes moved per unit | flops per byte |
 |---|---|---:|---:|
@@ -324,11 +367,12 @@ spread over blocks at all. The only parallel axis is across batch rows, which
 the CPU path already uses above its threshold.
 
 The device itself was not the blocker. On this host
-`nvidia-smi --query-gpu=memory.free` reported 4557 MiB free (gate: at least
-4000 MiB), and the documented `max.gpu` host surface compiles and runs on the
-pinned toolchain: a probe building and running `DeviceContext` with
-`enqueue_create_buffer[DType.float64]` and `synchronize()` succeeded on an
-RTX 5090. There is no GPU code in the port, therefore no GPU tests: nothing is
+`nvidia-smi --query-gpu=memory.free` reported 4557 MiB free in that phase, and
+4559 MiB free in the VERIFY pass (gate: at least 4000 MiB), and the documented
+`max.gpu` host surface compiles and runs on the pinned toolchain: a probe
+building and running `DeviceContext` with `enqueue_create_buffer[DType.float64]`
+and `synchronize()` succeeded on an RTX 5090. The VERIFY pass re-read the
+device's free memory (above) but did not rerun the probe. There is no GPU code in the port, therefore no GPU tests: nothing is
 skipped, because nothing GPU-only was added. The full test suite runs on a
 CPU-only host unchanged (`93 passed, 8 skipped`; all 8 skips are pre-existing
 lattice-shape guards in `tests/test_simd_paths.py` for unreachable EOS, not

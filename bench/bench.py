@@ -78,6 +78,9 @@ def python_utf8_boundaries(text):
 
 
 def main():
+    # Rows are printed as soon as they are measured: the reference timings take
+    # minutes on a loaded host, and a run cut short must not swallow the rows it
+    # already produced.
     print(f"Machine: {cpu_name()}; {platform.system()} {platform.machine()}")
     print()
     print("| benchmark | Mojo / compatibility | reference | ratio | result |")
